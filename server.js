@@ -41,6 +41,62 @@ function writeMeta(slug, data) {
 }
 
 // ─────────────────────────────────────────────────────────
+// SOUS-DOMAINES — doit être avant toutes les routes API
+// ─────────────────────────────────────────────────────────
+app.use((req, res, next) => {
+  const host  = req.hostname;
+  const match = host.match(/^([a-z0-9-]+)\.allpredictor\.com$/);
+  if (!match) return next();
+
+  const slug     = match[1];
+  const reserved = ['www','api','app','admin','dashboard','docs','mail','bot','builder'];
+  if (reserved.includes(slug)) return next();
+
+  const siteDir = path.join(SITES_DIR, slug);
+  if (!fs.existsSync(siteDir)) {
+    return res.status(404).send(`
+      <!DOCTYPE html>
+      <html lang="fr">
+      <head>
+        <meta charset="UTF-8"/>
+        <meta name="viewport" content="width=device-width,initial-scale=1"/>
+        <title>Site introuvable — AllPredictor</title>
+        <style>
+          body{font-family:sans-serif;background:#080d1a;color:#e8edf5;
+               display:flex;flex-direction:column;align-items:center;
+               justify-content:center;height:100vh;margin:0;text-align:center;}
+          h2{font-size:1.4rem;margin-bottom:8px;}
+          p{color:#8fa3c0;font-size:.9rem;margin-bottom:24px;}
+          a{color:#6391fa;text-decoration:none;font-weight:600;}
+        </style>
+      </head>
+      <body>
+        <div style="font-size:2.5rem;margin-bottom:16px;">🌐</div>
+        <h2>${slug}.allpredictor.com</h2>
+        <p>Ce site n'existe pas encore.</p>
+        <a href="https://allpredictor.com">← Retour à AllPredictor</a>
+      </body>
+      </html>
+    `);
+  }
+
+  // Clean URL : si on visite la racine, servir le fichier HTML principal
+  if (req.path === '/' || req.path === '') {
+    const indexPath = path.join(siteDir, 'index.html');
+    if (fs.existsSync(indexPath)) {
+      return res.sendFile(indexPath);
+    }
+    const htmlFiles = fs.readdirSync(siteDir)
+      .filter(f => f.endsWith('.html') && !f.startsWith('.'));
+    if (htmlFiles.length > 0) {
+      return res.sendFile(path.join(siteDir, htmlFiles[0]));
+    }
+  }
+
+  express.static(siteDir)(req, res, next);
+});
+
+// ─────────────────────────────────────────────────────────
 // ROUTES API
 // ─────────────────────────────────────────────────────────
 
@@ -152,61 +208,6 @@ app.delete('/api/sites/:slug', (req, res) => {
   res.json({ success: true });
 });
 
-// ─────────────────────────────────────────────────────────
-// SERVEUR STATIQUE — détection par sous-domaine
-// ─────────────────────────────────────────────────────────
-app.use((req, res, next) => {
-  const host  = req.hostname;
-  const match = host.match(/^([a-z0-9-]+)\.allpredictor\.com$/);
-  if (!match) return next();
-
-  const slug     = match[1];
-  const reserved = ['www','api','app','admin','dashboard','docs','mail','bot','builder'];
-  if (reserved.includes(slug)) return next();
-
-  const siteDir = path.join(SITES_DIR, slug);
-  if (!fs.existsSync(siteDir)) {
-    return res.status(404).send(`
-      <!DOCTYPE html>
-      <html lang="fr">
-      <head>
-        <meta charset="UTF-8"/>
-        <meta name="viewport" content="width=device-width,initial-scale=1"/>
-        <title>Site introuvable — AllPredictor</title>
-        <style>
-          body{font-family:sans-serif;background:#080d1a;color:#e8edf5;
-               display:flex;flex-direction:column;align-items:center;
-               justify-content:center;height:100vh;margin:0;text-align:center;}
-          h2{font-size:1.4rem;margin-bottom:8px;}
-          p{color:#8fa3c0;font-size:.9rem;margin-bottom:24px;}
-          a{color:#6391fa;text-decoration:none;font-weight:600;}
-        </style>
-      </head>
-      <body>
-        <div style="font-size:2.5rem;margin-bottom:16px;">🌐</div>
-        <h2>${slug}.allpredictor.com</h2>
-        <p>Ce site n'existe pas encore.</p>
-        <a href="https://allpredictor.com">← Retour à AllPredictor</a>
-      </body>
-      </html>
-    `);
-  }
-
-  // Clean URL : si on visite la racine, servir le fichier HTML principal
-  if (req.path === '/' || req.path === '') {
-    const indexPath = path.join(siteDir, 'index.html');
-    if (fs.existsSync(indexPath)) {
-      return res.sendFile(indexPath);
-    }
-    const htmlFiles = fs.readdirSync(siteDir)
-      .filter(f => f.endsWith('.html') && !f.startsWith('.'));
-    if (htmlFiles.length > 0) {
-      return res.sendFile(path.join(siteDir, htmlFiles[0]));
-    }
-  }
-
-  express.static(siteDir)(req, res, next);
-});
 
 app.listen(PORT, () => {
   console.log(`[OK] Sites Manager démarré — port ${PORT}`);
