@@ -192,6 +192,19 @@ app.use((req, res, next) => {
     `);
   }
 
+  // Clean URL : si on visite la racine, servir le fichier HTML principal
+  if (req.path === '/' || req.path === '') {
+    const indexPath = path.join(siteDir, 'index.html');
+    if (fs.existsSync(indexPath)) {
+      return res.sendFile(indexPath);
+    }
+    const htmlFiles = fs.readdirSync(siteDir)
+      .filter(f => f.endsWith('.html') && !f.startsWith('.'));
+    if (htmlFiles.length > 0) {
+      return res.sendFile(path.join(siteDir, htmlFiles[0]));
+    }
+  }
+
   express.static(siteDir)(req, res, next);
 });
 
