@@ -4,6 +4,7 @@ const AdmZip  = require('adm-zip');
 const cors    = require('cors');
 const fs      = require('fs');
 const path    = require('path');
+const crypto  = require('crypto');
 
 const app  = express();
 const PORT = process.env.PORT || 8080;
@@ -13,6 +14,77 @@ const SITES_DIR = path.join(__dirname, 'sites');
 const TMP_DIR   = path.join(__dirname, 'tmp');
 if (!fs.existsSync(SITES_DIR)) fs.mkdirSync(SITES_DIR);
 if (!fs.existsSync(TMP_DIR))   fs.mkdirSync(TMP_DIR);
+
+// ── Chiffrement AES-256-CBC ───────────────────────────────
+// Générer une clé : node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
+// Puis : export SITES_ENCRYPTION_KEY=<clé hex 64 chars>
+const ENC_ALGO = 'aes-256-cbc';
+const ENC_KEY  = process.env.SITES_ENCRYPTION_KEY
+  ? Buffer.from(process.env.SITES_ENCRYPTION_KEY, 'hex')
+  : null;
+
+const ENCRYPTION_ENABLED = ENC_KEY && ENC_KEY.length === 32;
+
+if (!ENCRYPTION_ENABLED) {
+  console.warn('[WARN] SITES_ENCRYPTION_KEY non défini ou invalide — chiffrement désactivé.');
+  console.warn('       Générez une clé : node -e "console.log(require(\'crypto\').randomBytes(32).toString(\'hex\'))"');
+}
+
+// Format sur disque : [16 bytes IV][ciphertext AES-256-CBC]
+function encryptBuffer(buf) {
+  const iv     = crypto.randomBytes(16);
+  const cipher = crypto.createCipheriv(ENC_ALGO, ENC_KEY, iv);
+  const enc    = Buffer.concat([cipher.update(buf), cipher.final()]);
+  return Buffer.concat([iv, enc]);
+}
+
+function decryptBuffer(buf) {
+  const iv         = buf.slice(0, 16);
+  const ciphertext = buf.slice(16);
+  const decipher   = crypto.createDecipheriv(ENC_ALGO, ENC_KEY, iv);
+  return Buffer.concat([decipher.update(ciphertext), decipher.final()]);
+}
+
+// ── MIME types ────────────────────────────────────────────
+const MIME_TYPES = {
+  '.html': 'text/html; charset=utf-8',
+  '.css':  'text/css',
+  '.js':   'application/javascript',
+  '.json': 'application/json',
+  '.png':  'image/png',
+  '.jpg':  'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.gif':  'image/gif',
+  '.svg':  'image/svg+xml',
+  '.ico':  'image/x-icon',
+  '.webp': 'image/webp',
+  '.woff': 'font/woff',
+  '.woff2':'font/woff2',
+  '.ttf':  'font/ttf',
+  '.mp4':  'video/mp4',
+  '.webm': 'video/webm',
+  '.pdf':  'application/pdf',
+};
+
+// Lire, déchiffrer si besoin, envoyer au navigateur
+function serveFile(filePath, res) {
+  if (!fs.existsSync(filePath)) return res.status(404).send('Not found');
+  try {
+    const raw  = fs.readFileSync(filePath);
+    const data = ENCRYPTION_ENABLED ? decryptBuffer(raw) : raw;
+    const ext  = path.extname(filePath).toLowerCase();
+    res.setHeader('Content-Type', MIME_TYPES[ext] || 'application/octet-stream');
+    res.send(data);
+  } catch (e) {
+    console.error('[SERVE ERROR]', e.message);
+    res.status(500).send('Erreur serveur');
+  }
+}
+
+// Chiffrer si besoin, écrire sur disque
+function writeFile(destPath, buf) {
+  fs.writeFileSync(destPath, ENCRYPTION_ENABLED ? encryptBuffer(buf) : buf);
+}
 
 // ── Middleware ────────────────────────────────────────────
 app.use(cors({ origin: '*' }));
@@ -34,6 +106,7 @@ function readMeta(slug) {
   try { return JSON.parse(fs.readFileSync(p, 'utf8')); } catch { return null; }
 }
 function writeMeta(slug, data) {
+  // .meta.json stocké en clair (métadonnées internes, jamais exposées)
   fs.writeFileSync(
     path.join(SITES_DIR, slug, '.meta.json'),
     JSON.stringify(data, null, 2)
@@ -80,20 +153,35 @@ app.use((req, res, next) => {
     `);
   }
 
-  // Clean URL : si on visite la racine, servir le fichier HTML principal
-  if (req.path === '/' || req.path === '') {
-    const indexPath = path.join(siteDir, 'index.html');
-    if (fs.existsSync(indexPath)) {
-      return res.sendFile(indexPath);
-    }
-    const htmlFiles = fs.readdirSync(siteDir)
-      .filter(f => f.endsWith('.html') && !f.startsWith('.'));
-    if (htmlFiles.length > 0) {
-      return res.sendFile(path.join(siteDir, htmlFiles[0]));
-    }
+  // Bloquer les fichiers cachés (.meta.json, etc.)
+  if (path.basename(req.path).startsWith('.')) return res.status(404).send('Not found');
+
+  // Résoudre le chemin et vérifier path traversal
+  const filePath = path.join(siteDir, req.path);
+  if (!filePath.startsWith(siteDir + path.sep) && filePath !== siteDir) {
+    return res.status(403).send('Interdit');
   }
 
-  express.static(siteDir)(req, res, next);
+  // Racine : chercher index.html ou premier .html
+  if (req.path === '/' || req.path === '') {
+    const indexPath = path.join(siteDir, 'index.html');
+    if (fs.existsSync(indexPath)) return serveFile(indexPath, res);
+    const htmlFiles = fs.readdirSync(siteDir)
+      .filter(f => f.endsWith('.html') && !f.startsWith('.'));
+    if (htmlFiles.length > 0) return serveFile(path.join(siteDir, htmlFiles[0]), res);
+    return next();
+  }
+
+  // Fichier direct
+  if (fs.existsSync(filePath) && fs.statSync(filePath).isFile()) {
+    return serveFile(filePath, res);
+  }
+
+  // Index dans un sous-dossier
+  const subIndex = path.join(filePath, 'index.html');
+  if (fs.existsSync(subIndex)) return serveFile(subIndex, res);
+
+  return res.status(404).send('Not found');
 });
 
 // ─────────────────────────────────────────────────────────
@@ -102,7 +190,7 @@ app.use((req, res, next) => {
 
 // Health check
 app.get('/', (req, res) => {
-  res.json({ status: 'ok', service: 'AllPredictor Sites Manager' });
+  res.json({ status: 'ok', service: 'AllPredictor Sites Manager', encryption: ENCRYPTION_ENABLED });
 });
 
 // Vérifier dispo d'un slug
@@ -161,13 +249,15 @@ app.post('/api/sites/deploy', upload.single('file'), async (req, res) => {
         const destPath = path.join(siteDir, entry.entryName);
         const destDir  = path.dirname(destPath);
         if (!fs.existsSync(destDir)) fs.mkdirSync(destDir, { recursive: true });
-        fs.writeFileSync(destPath, entry.getData());
+        writeFile(destPath, entry.getData()); // chiffré si ENCRYPTION_ENABLED
         files.push(entry.entryName);
       }
       fs.unlinkSync(file.path);
     } else {
       const dest = path.join(siteDir, file.originalname);
-      fs.renameSync(file.path, dest);
+      const raw  = fs.readFileSync(file.path);
+      writeFile(dest, raw); // chiffré si ENCRYPTION_ENABLED
+      fs.unlinkSync(file.path);
       files = [file.originalname];
     }
 
@@ -211,4 +301,5 @@ app.delete('/api/sites/:slug', (req, res) => {
 
 app.listen(PORT, () => {
   console.log(`[OK] Sites Manager démarré — port ${PORT}`);
+  console.log(`[ENC] Chiffrement AES-256 : ${ENCRYPTION_ENABLED ? 'ACTIVÉ' : 'DÉSACTIVÉ'}`);
 });
