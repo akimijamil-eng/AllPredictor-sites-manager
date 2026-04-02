@@ -5,6 +5,7 @@ const cors    = require('cors');
 const fs      = require('fs');
 const path    = require('path');
 const crypto  = require('crypto');
+const axios   = require('axios');
 
 const app  = express();
 const PORT = process.env.PORT || 8080;
@@ -16,8 +17,6 @@ if (!fs.existsSync(SITES_DIR)) fs.mkdirSync(SITES_DIR);
 if (!fs.existsSync(TMP_DIR))   fs.mkdirSync(TMP_DIR);
 
 // ── Chiffrement AES-256-CBC ───────────────────────────────
-// Générer une clé : node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
-// Puis : export SITES_ENCRYPTION_KEY=<clé hex 64 chars>
 const ENC_ALGO = 'aes-256-cbc';
 const ENC_KEY  = process.env.SITES_ENCRYPTION_KEY
   ? Buffer.from(process.env.SITES_ENCRYPTION_KEY, 'hex')
@@ -27,10 +26,8 @@ const ENCRYPTION_ENABLED = ENC_KEY && ENC_KEY.length === 32;
 
 if (!ENCRYPTION_ENABLED) {
   console.warn('[WARN] SITES_ENCRYPTION_KEY non défini ou invalide — chiffrement désactivé.');
-  console.warn('       Générez une clé : node -e "console.log(require(\'crypto\').randomBytes(32).toString(\'hex\'))"');
 }
 
-// Format sur disque : [16 bytes IV][ciphertext AES-256-CBC]
 function encryptBuffer(buf) {
   const iv     = crypto.randomBytes(16);
   const cipher = crypto.createCipheriv(ENC_ALGO, ENC_KEY, iv);
@@ -66,7 +63,6 @@ const MIME_TYPES = {
   '.pdf':  'application/pdf',
 };
 
-// Lire, déchiffrer si besoin, envoyer au navigateur
 function serveFile(filePath, res) {
   if (!fs.existsSync(filePath)) return res.status(404).send('Not found');
   try {
@@ -81,7 +77,6 @@ function serveFile(filePath, res) {
   }
 }
 
-// Chiffrer si besoin, écrire sur disque
 function writeFile(destPath, buf) {
   fs.writeFileSync(destPath, ENCRYPTION_ENABLED ? encryptBuffer(buf) : buf);
 }
@@ -89,6 +84,83 @@ function writeFile(destPath, buf) {
 // ── Middleware ────────────────────────────────────────────
 app.use(cors({ origin: '*' }));
 app.use(express.json());
+
+// ─────────────────────────────────────────────────────────
+// 🛡️ ShieldWall — Protection dynamique par sous-domaine
+// ─────────────────────────────────────────────────────────
+
+// Cache des associations slug → site_id (évite des appels répétés)
+const shieldCache = new Map(); // slug → { site_id, expires }
+const CACHE_TTL = 5 * 60 * 1000; // 5 minutes
+
+async function getShieldSiteId(slug) {
+  // Vérifier le cache
+  const cached = shieldCache.get(slug);
+  if (cached && cached.expires > Date.now()) {
+    return cached.site_id;
+  }
+
+  // Chercher le site_id dans le .meta.json local
+  const metaPath = path.join(SITES_DIR, slug, '.meta.json');
+  if (fs.existsSync(metaPath)) {
+    try {
+      const meta = JSON.parse(fs.readFileSync(metaPath, 'utf8'));
+      if (meta.shield_site_id) {
+        shieldCache.set(slug, { site_id: meta.shield_site_id, expires: Date.now() + CACHE_TTL });
+        return meta.shield_site_id;
+      }
+    } catch {}
+  }
+
+  return null; // Pas de site_id ShieldWall configuré
+}
+
+app.use(async (req, res, next) => {
+  // Détecter le sous-domaine
+  const host  = req.hostname;
+  const match = host.match(/^([a-z0-9-]+)\.allpredictor\.com$/);
+
+  // Si pas un sous-domaine (API principale, etc.) → pas de validation ShieldWall
+  if (!match) return next();
+
+  const slug = match[1];
+  const reserved = ['www', 'api', 'app', 'admin', 'dashboard', 'docs', 'mail', 'bot', 'builder'];
+  if (reserved.includes(slug)) return next();
+
+  // Récupérer le site_id ShieldWall associé à ce sous-domaine
+  const siteId = await getShieldSiteId(slug);
+
+  // Si pas de site_id ShieldWall configuré → laisser passer (protection non activée)
+  if (!siteId) return next();
+
+  try {
+    const { data } = await axios.post(
+      'https://shield-net-core.base44.app/api/functions/validateRequest',
+      {
+        site_id: siteId,
+        ip: req.headers['x-forwarded-for'] || req.ip,
+        user_agent: req.headers['user-agent'] || '',
+        path: req.path,
+        method: req.method,
+        api_key: req.headers['x-api-key'] || null,
+        jwt_token: req.headers['authorization']?.replace('Bearer ', '') || null,
+        query_params: req.query ? new URLSearchParams(req.query).toString() : '',
+        request_body: typeof req.body === 'string' ? req.body : JSON.stringify(req.body || ''),
+      },
+      { timeout: 2000 }
+    );
+
+    if (!data.allowed) {
+      return res.status(403).json({
+        error: 'Blocked by ShieldWall',
+        reason: data.reason,
+      });
+    }
+    next();
+  } catch (err) {
+    next(); // fail-open si ShieldWall injoignable
+  }
+});
 
 // ── Upload temporaire ─────────────────────────────────────
 const upload = multer({
@@ -106,7 +178,6 @@ function readMeta(slug) {
   try { return JSON.parse(fs.readFileSync(p, 'utf8')); } catch { return null; }
 }
 function writeMeta(slug, data) {
-  // .meta.json stocké en clair (métadonnées internes, jamais exposées)
   fs.writeFileSync(
     path.join(SITES_DIR, slug, '.meta.json'),
     JSON.stringify(data, null, 2)
@@ -147,22 +218,19 @@ app.use((req, res, next) => {
         <div style="font-size:2.5rem;margin-bottom:16px;">🌐</div>
         <h2>${slug}.allpredictor.com</h2>
         <p>Ce site n'existe pas encore.</p>
-        <a href="https://allpredictor.com">← Retour à AllPredictor</a>
+        <a href__="https://allpredictor.com">← Retour à AllPredictor</a>
       </body>
       </html>
     `);
   }
 
-  // Bloquer les fichiers cachés (.meta.json, etc.)
   if (path.basename(req.path).startsWith('.')) return res.status(404).send('Not found');
 
-  // Résoudre le chemin et vérifier path traversal
   const filePath = path.join(siteDir, req.path);
   if (!filePath.startsWith(siteDir + path.sep) && filePath !== siteDir) {
     return res.status(403).send('Interdit');
   }
 
-  // Racine : chercher index.html ou premier .html
   if (req.path === '/' || req.path === '') {
     const indexPath = path.join(siteDir, 'index.html');
     if (fs.existsSync(indexPath)) return serveFile(indexPath, res);
@@ -172,12 +240,10 @@ app.use((req, res, next) => {
     return next();
   }
 
-  // Fichier direct
   if (fs.existsSync(filePath) && fs.statSync(filePath).isFile()) {
     return serveFile(filePath, res);
   }
 
-  // Index dans un sous-dossier
   const subIndex = path.join(filePath, 'index.html');
   if (fs.existsSync(subIndex)) return serveFile(subIndex, res);
 
@@ -188,12 +254,10 @@ app.use((req, res, next) => {
 // ROUTES API
 // ─────────────────────────────────────────────────────────
 
-// Health check
 app.get('/', (req, res) => {
   res.json({ status: 'ok', service: 'AllPredictor Sites Manager', encryption: ENCRYPTION_ENABLED });
 });
 
-// Vérifier dispo d'un slug
 app.get('/api/sites/check/:slug', (req, res) => {
   const slug = cleanSlug(req.params.slug);
   if (!slug) return res.status(400).json({ error: 'Slug invalide' });
@@ -201,7 +265,6 @@ app.get('/api/sites/check/:slug', (req, res) => {
   res.json({ available: !exists, slug });
 });
 
-// Lister les sites d'un user
 app.get('/api/sites/list/:userId', (req, res) => {
   const { userId } = req.params;
   const sites = [];
@@ -214,17 +277,18 @@ app.get('/api/sites/list/:userId', (req, res) => {
   res.json({ sites });
 });
 
-// Déployer un site
+// ─────────────────────────────────────────────────────────
+// DEPLOY — avec association automatique ShieldWall
+// ─────────────────────────────────────────────────────────
 app.post('/api/sites/deploy', upload.single('file'), async (req, res) => {
   try {
-    const { slug: rawSlug, userId } = req.body;
+    const { slug: rawSlug, userId, shield_site_id } = req.body;
     if (!rawSlug || !userId)
       return res.status(400).json({ error: 'slug et userId requis' });
 
     const slug = cleanSlug(rawSlug);
     if (!slug) return res.status(400).json({ error: 'Slug invalide' });
 
-    // Vérifier ownership
     const existing = readMeta(slug);
     if (existing && existing.userId !== userId)
       return res.status(403).json({ error: 'Ce nom est déjà pris' });
@@ -249,20 +313,20 @@ app.post('/api/sites/deploy', upload.single('file'), async (req, res) => {
         const destPath = path.join(siteDir, entry.entryName);
         const destDir  = path.dirname(destPath);
         if (!fs.existsSync(destDir)) fs.mkdirSync(destDir, { recursive: true });
-        writeFile(destPath, entry.getData()); // chiffré si ENCRYPTION_ENABLED
+        writeFile(destPath, entry.getData());
         files.push(entry.entryName);
       }
       fs.unlinkSync(file.path);
     } else {
       const dest = path.join(siteDir, file.originalname);
       const raw  = fs.readFileSync(file.path);
-      writeFile(dest, raw); // chiffré si ENCRYPTION_ENABLED
+      writeFile(dest, raw);
       fs.unlinkSync(file.path);
       files = [file.originalname];
     }
 
     const now = new Date().toISOString();
-    writeMeta(slug, {
+    const metaData = {
       slug,
       userId,
       url: `https://${slug}.allpredictor.com`,
@@ -270,13 +334,26 @@ app.post('/api/sites/deploy', upload.single('file'), async (req, res) => {
       files,
       created_at: existing ? existing.created_at : now,
       updated_at: now,
-    });
+    };
+
+    // Associer le Site ID ShieldWall si fourni
+    if (shield_site_id) {
+      metaData.shield_site_id = shield_site_id;
+      // Invalider le cache
+      shieldCache.delete(slug);
+    } else if (existing && existing.shield_site_id) {
+      // Garder l'ancien shield_site_id si déjà configuré
+      metaData.shield_site_id = existing.shield_site_id;
+    }
+
+    writeMeta(slug, metaData);
 
     res.json({
       success: true,
       slug,
       url: `https://${slug}.allpredictor.com`,
       files,
+      shield_protected: !!metaData.shield_site_id,
     });
 
   } catch (e) {
@@ -287,7 +364,33 @@ app.post('/api/sites/deploy', upload.single('file'), async (req, res) => {
   }
 });
 
-// Supprimer un site
+// ─────────────────────────────────────────────────────────
+// LIER / DÉLIER ShieldWall à un site existant
+// ─────────────────────────────────────────────────────────
+app.post('/api/sites/:slug/shield', (req, res) => {
+  const slug   = cleanSlug(req.params.slug);
+  const { userId, shield_site_id } = req.body;
+  const meta   = readMeta(slug);
+
+  if (!meta) return res.status(404).json({ error: 'Site introuvable' });
+  if (meta.userId !== userId) return res.status(403).json({ error: 'Non autorisé' });
+
+  if (shield_site_id) {
+    meta.shield_site_id = shield_site_id;
+  } else {
+    delete meta.shield_site_id;
+  }
+
+  meta.updated_at = new Date().toISOString();
+  writeMeta(slug, meta);
+  shieldCache.delete(slug);
+
+  res.json({
+    success: true,
+    shield_protected: !!meta.shield_site_id,
+  });
+});
+
 app.delete('/api/sites/:slug', (req, res) => {
   const slug   = cleanSlug(req.params.slug);
   const { userId } = req.body;
@@ -295,11 +398,12 @@ app.delete('/api/sites/:slug', (req, res) => {
   if (!meta)                    return res.status(404).json({ error: 'Site introuvable' });
   if (meta.userId !== userId)   return res.status(403).json({ error: 'Non autorisé' });
   fs.rmSync(path.join(SITES_DIR, slug), { recursive: true, force: true });
+  shieldCache.delete(slug);
   res.json({ success: true });
 });
-
 
 app.listen(PORT, () => {
   console.log(`[OK] Sites Manager démarré — port ${PORT}`);
   console.log(`[ENC] Chiffrement AES-256 : ${ENCRYPTION_ENABLED ? 'ACTIVÉ' : 'DÉSACTIVÉ'}`);
+  console.log(`[🛡️] ShieldWall : ACTIVÉ (protection dynamique par sous-domaine)`);
 });
