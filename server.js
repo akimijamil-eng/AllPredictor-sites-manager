@@ -1,3 +1,5 @@
+Voici le server.js complet avec le SPA fallback :
+
 const express = require('express');
 const multer  = require('multer');
 const AdmZip  = require('adm-zip');
@@ -60,6 +62,18 @@ const MIME_TYPES = {
   '.mp4':  'video/mp4',
   '.webm': 'video/webm',
   '.pdf':  'application/pdf',
+  '.xml':  'application/xml',
+  '.txt':  'text/plain',
+  '.map':  'application/json',
+  '.mjs':  'application/javascript',
+  '.jsx':  'application/javascript',
+  '.ts':   'application/javascript',
+  '.tsx':  'application/javascript',
+  '.wasm': 'application/wasm',
+  '.avif': 'image/avif',
+  '.mp3':  'audio/mpeg',
+  '.ogg':  'audio/ogg',
+  '.wav':  'audio/wav',
 };
 
 function serveFile(filePath, res) {
@@ -159,7 +173,7 @@ app.use(async (req, res, next) => {
     }
     next();
   } catch (err) {
-    next(); // fail-open si ShieldWall injoignable
+    next();
   }
 });
 
@@ -186,7 +200,7 @@ function writeMeta(slug, data) {
 }
 
 // ─────────────────────────────────────────────────────────
-// SOUS-DOMAINES — doit être avant toutes les routes API
+// SOUS-DOMAINES — Sert les sites statiques + SPA fallback
 // ─────────────────────────────────────────────────────────
 app.use((req, res, next) => {
   const host  = req.hostname;
@@ -225,13 +239,16 @@ app.use((req, res, next) => {
     `);
   }
 
+  // Bloquer les fichiers cachés (.meta.json, .env, etc.)
   if (path.basename(req.path).startsWith('.')) return res.status(404).send('Not found');
 
+  // Sécurité : empêcher la traversée de répertoire
   const filePath = path.join(siteDir, req.path);
   if (!filePath.startsWith(siteDir + path.sep) && filePath !== siteDir) {
     return res.status(403).send('Interdit');
   }
 
+  // ── Racine du site ──
   if (req.path === '/' || req.path === '') {
     const indexPath = path.join(siteDir, 'index.html');
     if (fs.existsSync(indexPath)) return serveFile(indexPath, res);
@@ -241,12 +258,22 @@ app.use((req, res, next) => {
     return next();
   }
 
+  // ── Fichier existant → le servir directement ──
   if (fs.existsSync(filePath) && fs.statSync(filePath).isFile()) {
     return serveFile(filePath, res);
   }
 
+  // ── Sous-dossier avec index.html ──
   const subIndex = path.join(filePath, 'index.html');
   if (fs.existsSync(subIndex)) return serveFile(subIndex, res);
+
+  // ── SPA FALLBACK ──────────────────────────────────────
+  // Si aucun fichier trouvé ET qu'un index.html existe à la racine,
+  // on le sert → React, Vue, Angular, Svelte gèrent le routing côté client
+  const spaIndex = path.join(siteDir, 'index.html');
+  if (fs.existsSync(spaIndex)) {
+    return serveFile(spaIndex, res);
+  }
 
   return res.status(404).send('Not found');
 });
@@ -279,7 +306,7 @@ app.get('/api/sites/list/:userId', (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────
-// DEPLOY — avec association automatique ShieldWall
+// DEPLOY
 // ─────────────────────────────────────────────────────────
 app.post('/api/sites/deploy', upload.single('file'), async (req, res) => {
   try {
@@ -363,7 +390,7 @@ app.post('/api/sites/deploy', upload.single('file'), async (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────
-// LIER / DÉLIER ShieldWall à un site existant
+// LIER / DÉLIER ShieldWall
 // ─────────────────────────────────────────────────────────
 app.post('/api/sites/:slug/shield', (req, res) => {
   const slug   = cleanSlug(req.params.slug);
@@ -404,4 +431,5 @@ app.listen(PORT, () => {
   console.log(`[OK] Sites Manager démarré — port ${PORT}`);
   console.log(`[ENC] Chiffrement AES-256 : ${ENCRYPTION_ENABLED ? 'ACTIVÉ' : 'DÉSACTIVÉ'}`);
   console.log(`[🛡️] ShieldWall : ACTIVÉ (protection dynamique par sous-domaine)`);
+  console.log(`[SPA] Fallback index.html : ACTIVÉ (React, Vue, Angular, Svelte)`);
 });
