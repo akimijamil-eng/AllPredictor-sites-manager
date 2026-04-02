@@ -5,7 +5,6 @@ const cors    = require('cors');
 const fs      = require('fs');
 const path    = require('path');
 const crypto  = require('crypto');
-const axios   = require('axios');
 
 const app  = express();
 const PORT = process.env.PORT || 8080;
@@ -89,18 +88,15 @@ app.use(express.json());
 // 🛡️ ShieldWall — Protection dynamique par sous-domaine
 // ─────────────────────────────────────────────────────────
 
-// Cache des associations slug → site_id (évite des appels répétés)
-const shieldCache = new Map(); // slug → { site_id, expires }
-const CACHE_TTL = 5 * 60 * 1000; // 5 minutes
+const shieldCache = new Map();
+const CACHE_TTL = 5 * 60 * 1000;
 
 async function getShieldSiteId(slug) {
-  // Vérifier le cache
   const cached = shieldCache.get(slug);
   if (cached && cached.expires > Date.now()) {
     return cached.site_id;
   }
 
-  // Chercher le site_id dans le .meta.json local
   const metaPath = path.join(SITES_DIR, slug, '.meta.json');
   if (fs.existsSync(metaPath)) {
     try {
@@ -112,43 +108,48 @@ async function getShieldSiteId(slug) {
     } catch {}
   }
 
-  return null; // Pas de site_id ShieldWall configuré
+  return null;
 }
 
 app.use(async (req, res, next) => {
-  // Détecter le sous-domaine
   const host  = req.hostname;
   const match = host.match(/^([a-z0-9-]+)\.allpredictor\.com$/);
 
-  // Si pas un sous-domaine (API principale, etc.) → pas de validation ShieldWall
   if (!match) return next();
 
   const slug = match[1];
   const reserved = ['www', 'api', 'app', 'admin', 'dashboard', 'docs', 'mail', 'bot', 'builder'];
   if (reserved.includes(slug)) return next();
 
-  // Récupérer le site_id ShieldWall associé à ce sous-domaine
   const siteId = await getShieldSiteId(slug);
 
-  // Si pas de site_id ShieldWall configuré → laisser passer (protection non activée)
   if (!siteId) return next();
 
   try {
-    const { data } = await axios.post(
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 2000);
+
+    const response = await fetch(
       'https://shield-net-core.base44.app/api/functions/validateRequest',
       {
-        site_id: siteId,
-        ip: req.headers['x-forwarded-for'] || req.ip,
-        user_agent: req.headers['user-agent'] || '',
-        path: req.path,
-        method: req.method,
-        api_key: req.headers['x-api-key'] || null,
-        jwt_token: req.headers['authorization']?.replace('Bearer ', '') || null,
-        query_params: req.query ? new URLSearchParams(req.query).toString() : '',
-        request_body: typeof req.body === 'string' ? req.body : JSON.stringify(req.body || ''),
-      },
-      { timeout: 2000 }
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          site_id: siteId,
+          ip: req.headers['x-forwarded-for'] || req.ip,
+          user_agent: req.headers['user-agent'] || '',
+          path: req.path,
+          method: req.method,
+          api_key: req.headers['x-api-key'] || null,
+          jwt_token: req.headers['authorization']?.replace('Bearer ', '') || null,
+          query_params: req.query ? new URLSearchParams(req.query).toString() : '',
+          request_body: typeof req.body === 'string' ? req.body : JSON.stringify(req.body || ''),
+        }),
+        signal: controller.signal,
+      }
     );
+    clearTimeout(timeout);
+    const data = await response.json();
 
     if (!data.allowed) {
       return res.status(403).json({
@@ -336,13 +337,10 @@ app.post('/api/sites/deploy', upload.single('file'), async (req, res) => {
       updated_at: now,
     };
 
-    // Associer le Site ID ShieldWall si fourni
     if (shield_site_id) {
       metaData.shield_site_id = shield_site_id;
-      // Invalider le cache
       shieldCache.delete(slug);
     } else if (existing && existing.shield_site_id) {
-      // Garder l'ancien shield_site_id si déjà configuré
       metaData.shield_site_id = existing.shield_site_id;
     }
 
