@@ -1,5 +1,3 @@
-Voici le server.js complet avec le SPA fallback :
-
 const express = require('express');
 const multer  = require('multer');
 const AdmZip  = require('adm-zip');
